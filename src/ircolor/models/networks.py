@@ -199,4 +199,4 @@ class UNetColorizer(nn.Module):
         d1 = torch.cat([d1, x1], dim=1)
         x_dec1 = self.dec1(d1)
         
-        return self.final_conv(x_dec1)
+        return torch.sigmoid(self.final_conv(x_dec1))

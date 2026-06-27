@@ -110,13 +110,24 @@ def main() -> None:
     weight_accum = np.zeros((dst_h, dst_w), dtype=np.float32)
     
     print(f"Running tiled inference on grid size {src_h}x{src_w}...")
-    for y in range(0, src_h, stride):
-        for x in range(0, src_w, stride):
-            # Current tile boundaries
-            w_tile = min(tile_size, src_w - x)
+    # Generate list of start coordinates
+    y_starts = list(range(0, src_h - overlap, stride))
+    if not y_starts or y_starts[-1] + tile_size < src_h:
+        y_starts.append(max(0, src_h - tile_size))
+        
+    x_starts = list(range(0, src_w - overlap, stride))
+    if not x_starts or x_starts[-1] + tile_size < src_w:
+        x_starts.append(max(0, src_w - tile_size))
+        
+    # Remove duplicates if any
+    y_starts = sorted(list(set(y_starts)))
+    x_starts = sorted(list(set(x_starts)))
+    
+    for y in y_starts:
+        for x in x_starts:
+            # Current tile boundaries (always tile_size x tile_size unless image is smaller)
             h_tile = min(tile_size, src_h - y)
-            if w_tile < 16 or h_tile < 16:
-                continue
+            w_tile = min(tile_size, src_w - x)
                 
             # Extract tile and normalize
             tile_ir = ir_data[:, y:y+h_tile, x:x+w_tile]
@@ -133,15 +144,36 @@ def main() -> None:
                 
             pred_tile_np = pred_tile.squeeze(0).cpu().numpy() # (3, H*scale, W*scale)
             
+            # De-normalize predicted RGB back to absolute physical range [0, 30000]
+            pred_tile_np = pred_tile_np * 30000.0
+            
             # Scaled tile placement coordinates
             out_x = x * scale_factor
             out_y = y * scale_factor
             out_w = w_tile * scale_factor
             out_h = h_tile * scale_factor
             
-            # Compute cosine blending mask
-            mask = compute_cosine_mask(out_h, out_w, dst_overlap)
+            # Determine which boundaries should be feathered (only internal overlaps)
+            fade_top = (y > 0)
+            fade_bottom = (y + h_tile < src_h)
+            fade_left = (x > 0)
+            fade_right = (x + w_tile < src_w)
             
+            # Compute boundary-aware cosine blending mask
+            mask = np.ones((out_h, out_w), dtype=np.float32)
+            t = np.linspace(0, np.pi, dst_overlap)
+            fade_in = 0.5 - 0.5 * np.cos(t)
+            fade_out = fade_in[::-1]
+            
+            if fade_top and out_h > dst_overlap:
+                mask[:dst_overlap, :] *= fade_in[:, None]
+            if fade_bottom and out_h > dst_overlap:
+                mask[-dst_overlap:, :] *= fade_out[:, None]
+            if fade_left and out_w > dst_overlap:
+                mask[:, :dst_overlap] *= fade_in[None, :]
+            if fade_right and out_w > dst_overlap:
+                mask[:, -dst_overlap:] *= fade_out[None, :]
+                
             # Accumulate weighted results
             out_accum[:, out_y:out_y+out_h, out_x:out_x+out_w] += pred_tile_np * mask[None, :, :]
             weight_accum[out_y:out_y+out_h, out_x:out_x+out_w] += mask

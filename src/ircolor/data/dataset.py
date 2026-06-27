@@ -68,9 +68,8 @@ class LandsatIRDataset(Dataset):
             ir_data = (ir_data - ir_mean) / ir_std
             
             if rgb_data is not None:
-                rgb_mean = rgb_data.mean(axis=(1, 2), keepdims=True)
-                rgb_std = rgb_data.std(axis=(1, 2), keepdims=True) + 1e-8
-                rgb_data = (rgb_data - rgb_mean) / rgb_std
+                # Scale target RGB using a fixed global scale factor to preserve color channel ratios
+                rgb_data = np.clip(rgb_data / 30000.0, 0.0, 1.0)
                 
         elif self.normalize == "per_tile_minmax":
             ir_min = ir_data.min(axis=(1, 2), keepdims=True)
@@ -78,9 +77,8 @@ class LandsatIRDataset(Dataset):
             ir_data = (ir_data - ir_min) / (ir_max - ir_min + 1e-8) * 2.0 - 1.0
             
             if rgb_data is not None:
-                rgb_min = rgb_data.min(axis=(1, 2), keepdims=True)
-                rgb_max = rgb_data.max(axis=(1, 2), keepdims=True)
-                rgb_data = (rgb_data - rgb_min) / (rgb_max - rgb_min + 1e-8) * 2.0 - 1.0
+                # Scale target RGB using a fixed global scale factor to preserve color channel ratios
+                rgb_data = np.clip(rgb_data / 30000.0, 0.0, 1.0)
                 
         return TilePair(ir=ir_data, rgb=rgb_data, crs=crs, transform=transform)
 

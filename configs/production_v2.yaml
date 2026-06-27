@@ -39,11 +39,11 @@ model:
     semantic_loss_weight: 0.5
 
 optimization:
-  loss_weighting: "homoscedastic_uncertainty" # Dynamic auto-tuning enabled
+  loss_weighting: "static" # Use static high weights to enforce color convergence
   initial_weights:
     standard_loss: 1.0
-    gradient_loss: 0.1
-    semantic_loss: 0.5
+    gradient_loss: 0.5
+    semantic_loss: 2.5
   segmenter:
     backbone: "segformer_b2"
     weights: "frozen"
