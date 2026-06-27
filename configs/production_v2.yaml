@@ -1,0 +1,72 @@
+system:
+  version: "2.0"
+  device: "cuda"
+  mixed_precision: "fp16"
+
+stage: "joint" # Options: [sr, color, joint]
+
+data:
+  raw_dir: "data/raw"
+  tiles_dir: "data/tiles"
+  tile_size: 512
+  overlap: 64
+  rgb_bands: [4, 3, 2]       # Landsat 8/9 OLI: R=B4, G=B3, B=B2
+  ir_bands: [5, 10]          # NIR=B5, TIRS=B10
+  bit_depth: 16
+  val_split: 0.15
+  normalization:
+    algorithm: "per_tile_zscore" # Options: [per_tile_zscore, per_tile_minmax]
+  ingestion:
+    tile_size: 512
+    overlap: 64
+    format: "Float32_GeoTIFF"
+
+model:
+  sr:
+    arch: "real_esrgan"
+    upscale_factor: 4
+    scale: 4
+    extract_bridge_features: true
+    gradient_loss_weight: 0.1
+  color:
+    arch: "latent_diffusion_controlnet"
+    conditioning_type: "cross_attention_plus_spatial"
+    latent_channels: 4
+  semantic:
+    enabled: true
+    backbone: "segformer_b2"
+    weights_frozen: true
+    semantic_loss_weight: 0.5
+
+optimization:
+  loss_weighting: "homoscedastic_uncertainty" # Dynamic auto-tuning enabled
+  initial_weights:
+    standard_loss: 1.0
+    gradient_loss: 0.1
+    semantic_loss: 0.5
+  segmenter:
+    backbone: "segformer_b2"
+    weights: "frozen"
+
+train:
+  epochs: 100
+  batch_size: 8
+  lr: 2.0e-4
+  precision: "16-mixed"
+  accumulate_grad_batches: 1
+  num_workers: 4
+  ckpt_dir: "outputs"
+
+logging:
+  wandb_project: "ir-colorize"
+  log_images_every_n_steps: 200
+
+inference:
+  compiler: "tensorrt"
+  precision: "fp16"
+  blending_algorithm: "cosine_feathering"
+
+eval:
+  psnr_target: 31.5
+  ssim_target: 0.92
+  latency_target_ms: 85
