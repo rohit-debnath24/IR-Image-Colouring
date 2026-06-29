@@ -27,6 +27,17 @@ from ircolor.losses.objectives import (
     adversarial_loss
 )
 from ircolor.models.networks import VSSMNet, ControlNetColorizer, PatchGANDiscriminator
+from dataclasses import dataclass
+
+@dataclass
+class BatchPair:
+    ir: torch.Tensor
+    rgb: torch.Tensor
+
+def collate_fn(batch):
+    irs = torch.stack([torch.from_numpy(item.ir) for item in batch])
+    rgbs = torch.stack([torch.from_numpy(item.rgb) for item in batch])
+    return BatchPair(ir=irs, rgb=rgbs)
 
 # Mock modules for fallback/dry-runs
 class MockSR(nn.Module):
@@ -251,18 +262,6 @@ def main() -> None:
     train_size = len(dataset) - val_size
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
     
-    # Simple collation function to construct batch
-    def collate_fn(batch):
-        from dataclasses import dataclass
-        @dataclass
-        class BatchPair:
-            ir: torch.Tensor
-            rgb: torch.Tensor
-            
-        irs = torch.stack([torch.from_numpy(item.ir) for item in batch])
-        rgbs = torch.stack([torch.from_numpy(item.rgb) for item in batch])
-        return BatchPair(ir=irs, rgb=rgbs)
-
     train_loader = DataLoader(
         train_dataset, 
         batch_size=config.train.batch_size, 
