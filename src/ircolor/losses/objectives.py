@@ -91,8 +91,12 @@ def semantic_consistency_loss(
 ) -> torch.Tensor:
     """KL/CE between land-cover logits of predicted vs. ground-truth RGB. `frozen_seg` is eval-only."""
     with torch.no_grad():
-        target_logits = frozen_seg(target_rgb)
-    pred_logits = frozen_seg(pred_rgb)
+        target_out = frozen_seg(target_rgb)
+        target_logits = target_out.logits if hasattr(target_out, "logits") else target_out
+    
+    pred_out = frozen_seg(pred_rgb)
+    pred_logits = pred_out.logits if hasattr(pred_out, "logits") else pred_out
+    
     return F.kl_div(
         F.log_softmax(pred_logits, dim=1), F.softmax(target_logits, dim=1), reduction="batchmean"
     )
