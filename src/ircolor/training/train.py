@@ -267,13 +267,19 @@ def main() -> None:
         train_dataset, 
         batch_size=config.train.batch_size, 
         shuffle=True, 
-        collate_fn=collate_fn
+        collate_fn=collate_fn,
+        num_workers=2,
+        pin_memory=True,
+        persistent_workers=True
     )
     val_loader = DataLoader(
         val_dataset, 
         batch_size=config.train.batch_size, 
         shuffle=False, 
-        collate_fn=collate_fn
+        collate_fn=collate_fn,
+        num_workers=2,
+        pin_memory=True,
+        persistent_workers=True
     )
     
     # Initialize Model & Trainer
