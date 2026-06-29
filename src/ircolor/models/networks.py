@@ -193,14 +193,15 @@ class CrossAttentionBlock(nn.Module):
         if kv.shape[-2:] != q.shape[-2:]:
             kv = nn.functional.interpolate(kv, size=(H, W), mode="bilinear", align_corners=False)
             
-        Q = self.q_proj(q).view(B, self.heads, C // self.heads, -1).transpose(-1, -2) # B, heads, N, D
-        K = self.k_proj(kv).view(B, self.heads, C // self.heads, -1).transpose(-1, -2) # B, heads, N, D
-        V = self.v_proj(kv).view(B, self.heads, C // self.heads, -1).transpose(-1, -2) # B, heads, N, D
+        # Remove transpose to perform attention across channels (D) instead of spatial tokens (N)
+        Q = self.q_proj(q).view(B, self.heads, C // self.heads, -1) # B, heads, D, N
+        K = self.k_proj(kv).view(B, self.heads, C // self.heads, -1) # B, heads, D, N
+        V = self.v_proj(kv).view(B, self.heads, C // self.heads, -1) # B, heads, D, N
         
-        # Use PyTorch memory-efficient attention
+        # Use PyTorch memory-efficient attention (now O(C^2) instead of O(N^2))
         attn_out = torch.nn.functional.scaled_dot_product_attention(Q, K, V)
         
-        out = attn_out.transpose(-1, -2).reshape(B, C, H, W)
+        out = attn_out.reshape(B, C, H, W)
         return self.out_proj(out) + q
 
 # --- 4. ControlNet-Guided Generative Colorizer ---
