@@ -198,8 +198,11 @@ class CrossAttentionBlock(nn.Module):
         K = self.k_proj(kv).view(B, self.heads, C // self.heads, -1) # B, heads, D, N
         V = self.v_proj(kv).view(B, self.heads, C // self.heads, -1) # B, heads, D, N
         
-        # Use PyTorch memory-efficient attention (now O(C^2) instead of O(N^2))
-        attn_out = torch.nn.functional.scaled_dot_product_attention(Q, K, V)
+        # Manual channel attention math to bypass SDPA kernel limitations on large embedding dims (N=262144)
+        scale = (H * W) ** -0.5
+        attn = (Q @ K.transpose(-2, -1)) * scale # (B, heads, D, N) @ (B, heads, N, D) -> (B, heads, D, D)
+        attn = torch.nn.functional.softmax(attn, dim=-1)
+        attn_out = attn @ V # (B, heads, D, D) @ (B, heads, D, N) -> (B, heads, D, N)
         
         out = attn_out.reshape(B, C, H, W)
         return self.out_proj(out) + q
