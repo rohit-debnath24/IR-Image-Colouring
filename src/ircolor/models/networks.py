@@ -2,201 +2,175 @@ import torch
 import torch.nn as nn
 import numpy as np
 
-class ResidualBlock(nn.Module):
-    """Standard ResNet Residual Block with Conv, BatchNorm, and PReLU."""
-    def __init__(self, channels: int = 64):
+# --- 1. Wavelet / FEM Tools ---
+class HaarDownsample(nn.Module):
+    """Discrete Wavelet Transform (Haar) for Frequency Decoupling."""
+    def __init__(self, in_channels: int):
         super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(channels)
-        self.prelu = nn.PReLU()
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(channels)
+        self.in_channels = in_channels
+        self.out_channels = in_channels * 4
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, H, W)
+        x00 = x[..., 0::2, 0::2]
+        x01 = x[..., 0::2, 1::2]
+        x10 = x[..., 1::2, 0::2]
+        x11 = x[..., 1::2, 1::2]
+        
+        LL = (x00 + x01 + x10 + x11) / 4.0
+        HL = (x00 - x01 + x10 - x11) / 4.0
+        LH = (x00 + x01 - x10 - x11) / 4.0
+        HH = (x00 - x01 - x10 + x11) / 4.0
+        
+        return torch.cat([LL, HL, LH, HH], dim=1)
+
+# --- 2. VSSM / Mamba Backbone Proxy ---
+class SSMLinearAttention(nn.Module):
+    """Proxy for Visual State-Space Model block (Linear Complexity)."""
+    def __init__(self, dim: int):
+        super().__init__()
+        self.proj_in = nn.Linear(dim, dim * 2)
+        self.conv1d = nn.Conv1d(dim, dim, kernel_size=3, padding=1, groups=dim)
+        self.act = nn.SiLU()
+        self.proj_out = nn.Linear(dim, dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = x
-        out = self.bn1(self.conv1(x))
-        out = self.prelu(out)
-        out = self.bn2(self.conv2(out))
-        return out + residual
+        B, C, H, W = x.shape
+        seq = x.view(B, C, -1).transpose(1, 2)
+        
+        z = self.proj_in(seq)
+        x_proj, gate = z.chunk(2, dim=-1)
+        
+        x_proj = x_proj.transpose(1, 2)
+        x_proj = self.conv1d(x_proj).transpose(1, 2)
+        
+        out = x_proj * self.act(gate)
+        out = self.proj_out(out)
+        
+        return out.transpose(1, 2).view(B, C, H, W) + x
 
-class SRResNet(nn.Module):
-    """Deep residual network for 4x geospatial super-resolution."""
-    def __init__(self, in_channels: int = 2, scale: int = 4, num_res_blocks: int = 8):
+class VSSMNet(nn.Module):
+    """Dual-Stream, Frequency-Decoupled State-Space Backbone."""
+    def __init__(self, in_channels: int = 2, scale: int = 4, dim: int = 64):
         super().__init__()
         self.scale = scale
-        self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=9, padding=4)
-        self.prelu = nn.PReLU()
         
-        self.res_blocks = nn.Sequential(*[ResidualBlock(64) for _ in range(num_res_blocks)])
+        self.stem = nn.Conv2d(in_channels, dim, kernel_size=3, padding=1)
         
-        self.conv2 = nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(64)
+        # VSSM Blocks
+        self.vssm_blocks = nn.Sequential(*[SSMLinearAttention(dim) for _ in range(4)])
         
-        # Upsampling block using PixelShuffle (sub-pixel convolution)
+        # FEM (Frequency Decoupling)
+        self.wavelet_down = HaarDownsample(dim)
+        self.fem_proj = nn.Conv2d(dim * 4, dim, kernel_size=1)
+        
+        # Upsampling via Sub-Pixel
         upsample_blocks = []
         num_upsamples = int(np.log2(scale)) if scale > 1 else 0
         for _ in range(num_upsamples):
-            upsample_blocks.append(nn.Conv2d(64, 256, kernel_size=3, padding=1))
+            upsample_blocks.append(nn.Conv2d(dim, dim * 4, kernel_size=3, padding=1))
             upsample_blocks.append(nn.PixelShuffle(upscale_factor=2))
-            upsample_blocks.append(nn.PReLU())
+            upsample_blocks.append(nn.SiLU())
             
         self.upsample = nn.Sequential(*upsample_blocks)
-        self.conv_out = nn.Conv2d(64, in_channels, kernel_size=9, padding=4)
-
+        self.conv_out = nn.Conv2d(dim, in_channels, kernel_size=3, padding=1)
+        
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out1 = self.prelu(self.conv1(x))
-        out = self.res_blocks(out1)
-        out = self.bn2(self.conv2(out))
-        out = out + out1
-        out = self.upsample(out)
-        return self.conv_out(out)
+        hr, _ = self.forward_with_features(x)
+        return hr
         
     def forward_with_features(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Runs forward pass and extracts features for cross-attention/skip conditioning."""
-        out1 = self.prelu(self.conv1(x))
-        features = self.res_blocks(out1)
-        out = self.bn2(self.conv2(features))
-        out = out + out1
-        out = self.upsample(out)
-        hr_ir = self.conv_out(out)
-        return hr_ir, features
+        feat = self.stem(x)
+        
+        vssm_feat = self.vssm_blocks(feat)
+        
+        freq_feat = self.wavelet_down(feat)
+        freq_feat = self.fem_proj(freq_feat)
+        freq_feat = nn.functional.interpolate(freq_feat, scale_factor=2, mode="bilinear", align_corners=False)
+        
+        combined_feat = vssm_feat + freq_feat
+        hr_feat = self.upsample(combined_feat)
+        hr_ir = self.conv_out(hr_feat)
+        
+        return hr_ir, hr_feat
 
-class UNetColorizer(nn.Module):
-    """Deep U-Net for translating co-registered IR/Thermal bands to natural RGB."""
-    def __init__(self, in_channels: int = 2, out_channels: int = 3):
+# --- 3. Cross-Attention Skip Connections ---
+class CrossAttentionBlock(nn.Module):
+    def __init__(self, q_dim: int, kv_dim: int, heads: int = 4):
+        super().__init__()
+        self.heads = heads
+        self.q_proj = nn.Conv2d(q_dim, q_dim, kernel_size=1)
+        self.k_proj = nn.Conv2d(kv_dim, q_dim, kernel_size=1)
+        self.v_proj = nn.Conv2d(kv_dim, q_dim, kernel_size=1)
+        self.out_proj = nn.Conv2d(q_dim, q_dim, kernel_size=1)
+        self.scale = (q_dim // heads) ** -0.5
+
+    def forward(self, q: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = q.shape
+        if kv.shape[-2:] != q.shape[-2:]:
+            kv = nn.functional.interpolate(kv, size=(H, W), mode="bilinear", align_corners=False)
+            
+        Q = self.q_proj(q).view(B, self.heads, C // self.heads, -1).transpose(-1, -2) # B, heads, N, D
+        K = self.k_proj(kv).view(B, self.heads, C // self.heads, -1).transpose(-1, -2) # B, heads, N, D
+        V = self.v_proj(kv).view(B, self.heads, C // self.heads, -1).transpose(-1, -2) # B, heads, N, D
+        
+        # Use PyTorch memory-efficient attention
+        attn_out = torch.nn.functional.scaled_dot_product_attention(Q, K, V)
+        
+        out = attn_out.transpose(-1, -2).reshape(B, C, H, W)
+        return self.out_proj(out) + q
+
+# --- 4. ControlNet-Guided Generative Colorizer ---
+class ControlNetColorizer(nn.Module):
+    """U-Net with Cross-Attention structural guidance."""
+    def __init__(self, in_channels: int = 2, out_channels: int = 3, bridge_dim: int = 64):
         super().__init__()
         # Encoder
-        self.enc1 = nn.Sequential(
-            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(32, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
-        self.pool1 = nn.MaxPool2d(2) # 256x256
+        self.enc1 = nn.Sequential(nn.Conv2d(in_channels, 32, 3, 1, 1), nn.SiLU(), nn.Conv2d(32, 32, 3, 1, 1), nn.SiLU())
+        self.pool1 = nn.MaxPool2d(2)
         
-        self.enc2 = nn.Sequential(
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
-        self.pool2 = nn.MaxPool2d(2) # 128x128
+        self.enc2 = nn.Sequential(nn.Conv2d(32, 64, 3, 1, 1), nn.SiLU(), nn.Conv2d(64, 64, 3, 1, 1), nn.SiLU())
+        self.pool2 = nn.MaxPool2d(2)
         
-        # Bridge features concatenated at 128x128 level: 64 (enc2) + 64 (bridge) = 128 channels
-        self.enc3 = nn.Sequential(
-            nn.Conv2d(128, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(128, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
-        self.pool3 = nn.MaxPool2d(2) # 64x64
+        # Cross-Attention Bridges
+        self.attn_bridge1 = CrossAttentionBlock(q_dim=32, kv_dim=bridge_dim)
+        self.attn_bridge2 = CrossAttentionBlock(q_dim=64, kv_dim=bridge_dim)
         
-        self.enc4 = nn.Sequential(
-            nn.Conv2d(128, 256, kernel_size=3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(256, 256, kernel_size=3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
-        self.pool4 = nn.MaxPool2d(2) # 32x32
+        self.bottleneck = nn.Sequential(nn.Conv2d(64, 128, 3, 1, 1), nn.SiLU(), nn.Conv2d(128, 128, 3, 1, 1), nn.SiLU())
         
-        # Bottleneck
-        self.bottleneck = nn.Sequential(
-            nn.Conv2d(256, 512, kernel_size=3, padding=1),
-            nn.BatchNorm2d(512),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(512, 256, kernel_size=3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
+        self.attn_bridge_bn = CrossAttentionBlock(q_dim=128, kv_dim=bridge_dim)
         
         # Decoder
-        self.up4 = nn.ConvTranspose2d(256, 256, kernel_size=2, stride=2) # 64x64
-        self.dec4 = nn.Sequential(
-            nn.Conv2d(512, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
+        self.up2 = nn.ConvTranspose2d(128, 64, 2, 2)
+        self.dec2 = nn.Sequential(nn.Conv2d(128, 64, 3, 1, 1), nn.SiLU())
         
-        self.up3 = nn.ConvTranspose2d(128, 128, kernel_size=2, stride=2) # 128x128
-        self.dec3 = nn.Sequential(
-            nn.Conv2d(256, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
+        self.up1 = nn.ConvTranspose2d(64, 32, 2, 2)
+        self.dec1 = nn.Sequential(nn.Conv2d(64, 32, 3, 1, 1), nn.SiLU())
         
-        self.up2 = nn.ConvTranspose2d(64, 64, kernel_size=2, stride=2) # 256x256
-        self.dec2 = nn.Sequential(
-            nn.Conv2d(128, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
-        
-        self.up1 = nn.ConvTranspose2d(32, 32, kernel_size=2, stride=2) # 512x512
-        self.dec1 = nn.Sequential(
-            nn.Conv2d(64, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
-        
-        self.final_conv = nn.Conv2d(32, out_channels, kernel_size=1)
+        self.final = nn.Conv2d(32, out_channels, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_conditioned(x, None)
+        b_feat = torch.zeros(x.size(0), 64, x.size(2), x.size(3), device=x.device, dtype=x.dtype)
+        return self.forward_conditioned(x, b_feat)
         
-    def forward_conditioned(self, x: torch.Tensor, bridge_features: torch.Tensor | None = None) -> torch.Tensor:
+    def forward_conditioned(self, x: torch.Tensor, bridge_features: torch.Tensor) -> torch.Tensor:
         x1 = self.enc1(x)
-        p1 = self.pool1(x1)
+        x1_cond = self.attn_bridge1(x1, bridge_features)
+        p1 = self.pool1(x1_cond)
         
         x2 = self.enc2(p1)
-        p2 = self.pool2(x2)
+        x2_cond = self.attn_bridge2(x2, bridge_features)
+        p2 = self.pool2(x2_cond)
         
-        # Concat bridge features if present at the 128x128 bottleneck inlet
-        if bridge_features is not None:
-            if bridge_features.shape[-2:] != p2.shape[-2:]:
-                bridge_features = nn.functional.interpolate(bridge_features, size=p2.shape[-2:], mode="bilinear", align_corners=False)
-            p2_cond = torch.cat([p2, bridge_features], dim=1)
-        else:
-            zeros = torch.zeros(p2.size(0), 64, p2.size(2), p2.size(3), device=p2.device, dtype=p2.dtype)
-            p2_cond = torch.cat([p2, zeros], dim=1)
-            
-        x3 = self.enc3(p2_cond)
-        p3 = self.pool3(x3)
+        b = self.bottleneck(p2)
+        b_cond = self.attn_bridge_bn(b, bridge_features)
         
-        x4 = self.enc4(p3)
-        p4 = self.pool4(x4)
-        
-        b = self.bottleneck(p4)
-        
-        d4 = self.up4(b)
-        if d4.shape[-2:] != x4.shape[-2:]:
-            d4 = nn.functional.interpolate(d4, size=x4.shape[-2:], mode="bilinear", align_corners=False)
-        d4 = torch.cat([d4, x4], dim=1)
-        x_dec4 = self.dec4(d4)
-        
-        d3 = self.up3(x_dec4)
-        if d3.shape[-2:] != x3.shape[-2:]:
-            d3 = nn.functional.interpolate(d3, size=x3.shape[-2:], mode="bilinear", align_corners=False)
-        d3 = torch.cat([d3, x3], dim=1)
-        x_dec3 = self.dec3(d3)
-        
-        d2 = self.up2(x_dec3)
-        if d2.shape[-2:] != x2.shape[-2:]:
-            d2 = nn.functional.interpolate(d2, size=x2.shape[-2:], mode="bilinear", align_corners=False)
-        d2 = torch.cat([d2, x2], dim=1)
+        d2 = self.up2(b_cond)
+        d2 = torch.cat([d2, x2_cond], dim=1)
         x_dec2 = self.dec2(d2)
         
         d1 = self.up1(x_dec2)
-        if d1.shape[-2:] != x1.shape[-2:]:
-            d1 = nn.functional.interpolate(d1, size=x1.shape[-2:], mode="bilinear", align_corners=False)
-        d1 = torch.cat([d1, x1], dim=1)
+        d1 = torch.cat([d1, x1_cond], dim=1)
         x_dec1 = self.dec1(d1)
         
-        return torch.sigmoid(self.final_conv(x_dec1))
+        return torch.sigmoid(self.final(x_dec1))

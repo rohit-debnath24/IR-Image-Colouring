@@ -55,6 +55,32 @@ def gradient_ssim_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor
     return 0.5 * (loss_x + loss_y)
 
 
+def direction_aligned_gradient_loss(pred: torch.Tensor, target: torch.Tensor, scales: int = 3) -> torch.Tensor:
+    """Direction-Aligned Multi-Scale Gradient Loss.
+    
+    Supervises horizontal and vertical gradient components separately across
+    multiple downsampled scales to eliminate directional blur.
+    """
+    def get_gradients(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        gx = x[..., :, 1:] - x[..., :, :-1]
+        gy = x[..., 1:, :] - x[..., :-1, :]
+        return gx, gy
+
+    loss = 0.0
+    for scale in range(scales):
+        if scale > 0:
+            pred = F.avg_pool2d(pred, kernel_size=2, stride=2)
+            target = F.avg_pool2d(target, kernel_size=2, stride=2)
+            
+        pgx, pgy = get_gradients(pred)
+        tgx, tgy = get_gradients(target)
+        
+        # Scale-normalized L1 loss on directed gradients
+        loss += F.l1_loss(pgx, tgx) + F.l1_loss(pgy, tgy)
+        
+    return loss / scales
+
+
 def semantic_consistency_loss(
     pred_rgb: torch.Tensor, target_rgb: torch.Tensor, frozen_seg: torch.nn.Module
 ) -> torch.Tensor:

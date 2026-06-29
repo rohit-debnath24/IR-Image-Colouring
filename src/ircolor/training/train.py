@@ -20,11 +20,11 @@ from omegaconf import OmegaConf
 from ircolor.models.pipeline import IRColorPipeline
 from ircolor.data.dataset import LandsatIRDataset
 from ircolor.losses.objectives import (
-    gradient_ssim_loss,
+    direction_aligned_gradient_loss,
     semantic_consistency_loss,
     UncertaintyWeightedLoss,
 )
-from ircolor.models.networks import SRResNet, UNetColorizer
+from ircolor.models.networks import VSSMNet, ControlNetColorizer
 
 # Mock modules for fallback/dry-runs
 class MockSR(nn.Module):
@@ -71,8 +71,8 @@ class IRColorLightningModule(pl.LightningModule):
         c_ir = len(config.data.ir_bands)
         try:
             self.pipeline = IRColorPipeline(
-                sr=SRResNet(in_channels=c_ir, scale=config.model.sr.scale),
-                colorizer=UNetColorizer(in_channels=c_ir),
+                sr=VSSMNet(in_channels=c_ir, scale=config.model.sr.scale, dim=64),
+                colorizer=ControlNetColorizer(in_channels=c_ir, bridge_dim=64),
                 semantic=MockSegmenter() if config.model.semantic.enabled else None,
                 extract_bridge_features=config.model.sr.extract_bridge_features
             )
@@ -109,7 +109,7 @@ class IRColorLightningModule(pl.LightningModule):
         loss_standard = nn.functional.l1_loss(pred_rgb, rgb)
         
         # 1. Gradient SSIM Loss
-        loss_grad = gradient_ssim_loss(pred_rgb, rgb)
+        loss_grad = direction_aligned_gradient_loss(pred_rgb, rgb)
         
         # 2. Semantic Consistency Loss (Guardrail)
         if self.pipeline.semantic is not None:
