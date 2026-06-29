@@ -23,8 +23,9 @@ from ircolor.losses.objectives import (
     direction_aligned_gradient_loss,
     semantic_consistency_loss,
     UncertaintyWeightedLoss,
+    adversarial_loss
 )
-from ircolor.models.networks import VSSMNet, ControlNetColorizer
+from ircolor.models.networks import VSSMNet, ControlNetColorizer, PatchGANDiscriminator
 
 # Mock modules for fallback/dry-runs
 class MockSR(nn.Module):
@@ -66,14 +67,28 @@ class IRColorLightningModule(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         self.config = config
+        self.automatic_optimization = False
+        self.discriminator = PatchGANDiscriminator(in_channels=3)
         
         # Instantiate real deep cascade networks
         c_ir = len(config.data.ir_bands)
+        
+        # Load Segformer
+        if config.model.semantic.enabled:
+            try:
+                from transformers import SegformerForSemanticSegmentation
+                semantic_net = SegformerForSemanticSegmentation.from_pretrained('nvidia/segformer-b0-finetuned-cityscapes-512-512')
+            except Exception as e:
+                print(f"Failed to load SegFormer: {e}. Using MockSegmenter.")
+                semantic_net = MockSegmenter()
+        else:
+            semantic_net = None
+
         try:
             self.pipeline = IRColorPipeline(
                 sr=VSSMNet(in_channels=c_ir, scale=config.model.sr.scale, dim=64),
                 colorizer=ControlNetColorizer(in_channels=c_ir, bridge_dim=64),
-                semantic=MockSegmenter() if config.model.semantic.enabled else None,
+                semantic=semantic_net,
                 extract_bridge_features=config.model.sr.extract_bridge_features
             )
         except Exception as e:
@@ -102,37 +117,37 @@ class IRColorLightningModule(pl.LightningModule):
         return self.pipeline(ir)
 
     def training_step(self, batch, batch_idx):
+        opt_g, opt_d = self.optimizers()
         ir, rgb = batch.ir, batch.rgb
+        
+        # ---------------------
+        # Train Generator
+        # ---------------------
+        self.toggle_optimizer(opt_g)
         pred_rgb = self.pipeline(ir)
         
-        # Compute individual losses
         loss_standard = nn.functional.l1_loss(pred_rgb, rgb)
-        
-        # 1. Gradient SSIM Loss
         loss_grad = direction_aligned_gradient_loss(pred_rgb, rgb)
         
-        # 2. Semantic Consistency Loss (Guardrail)
         if self.pipeline.semantic is not None:
             loss_sem = semantic_consistency_loss(pred_rgb, rgb, self.pipeline.semantic)
         else:
             loss_sem = torch.tensor(0.0, device=self.device)
             
-        # Optimization Stage Routing
+        # Adversarial Generator Loss
+        fake_logits = self.discriminator(pred_rgb)
+        loss_g_adv = adversarial_loss(fake_logits, is_real=True)
+        
         stage = self.config.stage
         if stage == "sr":
-            # For SR stage, optimize solely on reconstruction + gradient details
-            loss = loss_standard + self.config.model.sr.gradient_loss_weight * loss_grad
-            self.log("train_loss", loss, prog_bar=True)
-            return loss
+            loss_g = loss_standard + self.config.model.sr.gradient_loss_weight * loss_grad
         elif stage == "color":
-            # For Color stage, optimize colorizer on L1 + semantic guardrail
-            loss = loss_standard + self.config.model.semantic.semantic_loss_weight * loss_sem
-            self.log("train_loss", loss, prog_bar=True)
-            return loss
+            loss_g = loss_standard + self.config.model.semantic.semantic_loss_weight * loss_sem + loss_g_adv
         else:
-            # stage == "joint" -> full cascade optimized with homoscedastic uncertainty weighting
+            # joint
             if self.uncertainty_loss is not None:
-                loss, weights = self.uncertainty_loss([loss_standard, loss_grad, loss_sem])
+                loss_g_base, weights = self.uncertainty_loss([loss_standard, loss_grad, loss_sem])
+                loss_g = loss_g_base + loss_g_adv
                 self.log("weight_standard", weights[0])
                 self.log("weight_grad", weights[1])
                 self.log("weight_sem", weights[2])
@@ -140,13 +155,37 @@ class IRColorLightningModule(pl.LightningModule):
                 w_std = self.config.optimization.initial_weights.standard_loss
                 w_grad = self.config.optimization.initial_weights.gradient_loss
                 w_sem = self.config.optimization.initial_weights.semantic_loss
-                loss = w_std * loss_standard + w_grad * loss_grad + w_sem * loss_sem
-                
-            self.log("train_loss", loss, prog_bar=True)
-            self.log("train_l1", loss_standard)
-            self.log("train_grad", loss_grad)
-            self.log("train_sem", loss_sem)
-            return loss
+                loss_g = w_std * loss_standard + w_grad * loss_grad + w_sem * loss_sem + loss_g_adv
+        
+        self.manual_backward(loss_g)
+        opt_g.step()
+        opt_g.zero_grad()
+        self.untoggle_optimizer(opt_g)
+        
+        # ---------------------
+        # Train Discriminator
+        # ---------------------
+        self.toggle_optimizer(opt_d)
+        
+        real_logits = self.discriminator(rgb)
+        loss_d_real = adversarial_loss(real_logits, is_real=True)
+        
+        fake_logits_d = self.discriminator(pred_rgb.detach())
+        loss_d_fake = adversarial_loss(fake_logits_d, is_real=False)
+        
+        loss_d = (loss_d_real + loss_d_fake) / 2
+        
+        self.manual_backward(loss_d)
+        opt_d.step()
+        opt_d.zero_grad()
+        self.untoggle_optimizer(opt_d)
+        
+        # Logging
+        self.log("train_g_loss", loss_g, prog_bar=True)
+        self.log("train_d_loss", loss_d, prog_bar=True)
+        self.log("train_l1", loss_standard)
+        self.log("train_grad", loss_grad)
+        self.log("train_sem", loss_sem)
 
     def validation_step(self, batch, batch_idx):
         ir, rgb = batch.ir, batch.rgb
@@ -156,13 +195,14 @@ class IRColorLightningModule(pl.LightningModule):
         return val_l1
 
     def configure_optimizers(self):
-        params = list(self.pipeline.parameters())
+        params_g = list(self.pipeline.parameters())
         if self.uncertainty_loss is not None:
-            params += list(self.uncertainty_loss.parameters())
+            params_g += list(self.uncertainty_loss.parameters())
             
-        optimizer = torch.optim.AdamW(params, lr=self.config.train.lr)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.config.train.epochs)
-        return [optimizer], [scheduler]
+        opt_g = torch.optim.AdamW(params_g, lr=self.config.train.lr)
+        opt_d = torch.optim.AdamW(self.discriminator.parameters(), lr=self.config.train.lr)
+        
+        return [opt_g, opt_d], []
 
 
 def main() -> None:

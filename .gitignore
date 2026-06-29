@@ -12,3 +12,7 @@ wandb/
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
+
+# Ignore large dataset archives
+dataset.zip
+*.zip

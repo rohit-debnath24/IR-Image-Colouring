@@ -11,6 +11,11 @@ import torch
 import torch.nn.functional as F
 
 
+def adversarial_loss(logits: torch.Tensor, is_real: bool) -> torch.Tensor:
+    """Binary Cross-Entropy for Adversarial Training (PatchGAN)."""
+    target = torch.ones_like(logits) if is_real else torch.zeros_like(logits)
+    return F.binary_cross_entropy_with_logits(logits, target)
+
 def gradient_intensity_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """Penalize edge/gradient mismatch (Sobel-like finite differences)."""
     def grad(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

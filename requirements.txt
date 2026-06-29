@@ -20,6 +20,7 @@ scikit-image>=0.22
 
 # --- Models / metrics ---
 segformer-pytorch>=0.0.6
+transformers>=4.38.0
 clean-fid>=0.1.35
 lpips>=0.1.4
 

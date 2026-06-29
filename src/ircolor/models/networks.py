@@ -22,30 +22,87 @@ class HaarDownsample(nn.Module):
         LH = (x00 + x01 - x10 - x11) / 4.0
         HH = (x00 - x01 - x10 + x11) / 4.0
         
-        return torch.cat([LL, HL, LH, HH], dim=1)
+        return LL, HL, LH, HH
+
+class MultiLevelHaarDWT(nn.Module):
+    """3-Level Multi-Scale Wavelet Decomposition (FEM)."""
+    def __init__(self, in_channels: int):
+        super().__init__()
+        self.dwt = HaarDownsample(in_channels)
+        
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        # Returns: LL3, [HF1, HF2, HF3] where HF = [HL, LH, HH] concatenated
+        hfs = []
+        ll = x
+        for _ in range(3):
+            if ll.shape[2] % 2 != 0 or ll.shape[3] % 2 != 0:
+                # Pad to even dimensions for DWT if needed
+                ll = nn.functional.pad(ll, (0, ll.shape[3] % 2, 0, ll.shape[2] % 2))
+            ll, hl, lh, hh = self.dwt(ll)
+            hf = torch.cat([hl, lh, hh], dim=1)
+            hfs.append(hf)
+        return ll, hfs
 
 # --- 2. VSSM / Mamba Backbone Proxy ---
-class SSMLinearAttention(nn.Module):
-    """Proxy for Visual State-Space Model block (Linear Complexity)."""
-    def __init__(self, dim: int):
+class MambaBlock(nn.Module):
+    """Pure PyTorch implementation of Mamba Block (State-Space Model)."""
+    def __init__(self, d_model: int, d_state: int = 16, d_conv: int = 4, expand: int = 2):
         super().__init__()
-        self.proj_in = nn.Linear(dim, dim * 2)
-        self.conv1d = nn.Conv1d(dim, dim, kernel_size=3, padding=1, groups=dim)
+        self.d_model = d_model
+        self.d_inner = int(expand * d_model)
+        self.d_state = d_state
+        
+        self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=False)
+        self.conv1d = nn.Conv1d(
+            in_channels=self.d_inner, out_channels=self.d_inner, bias=True,
+            kernel_size=d_conv, groups=self.d_inner, padding=d_conv - 1
+        )
+        self.x_proj = nn.Linear(self.d_inner, d_state * 2 + 1, bias=False)
+        self.dt_proj = nn.Linear(1, self.d_inner, bias=True)
+        
+        A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
+        self.A_log = nn.Parameter(torch.log(A))
+        self.D = nn.Parameter(torch.ones(self.d_inner))
+        self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
         self.act = nn.SiLU()
-        self.proj_out = nn.Linear(dim, dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
-        seq = x.view(B, C, -1).transpose(1, 2)
+        L = H * W
+        u = x.view(B, C, L).transpose(1, 2) # (B, L, d_model)
         
-        z = self.proj_in(seq)
-        x_proj, gate = z.chunk(2, dim=-1)
+        xz = self.in_proj(u) # (B, L, 2 * d_inner)
+        x_proj, z = xz.chunk(2, dim=-1) # (B, L, d_inner) each
         
         x_proj = x_proj.transpose(1, 2)
-        x_proj = self.conv1d(x_proj).transpose(1, 2)
+        x_proj = self.conv1d(x_proj)[:, :, :L]
+        x_proj = x_proj.transpose(1, 2)
+        x_proj = self.act(x_proj)
         
-        out = x_proj * self.act(gate)
-        out = self.proj_out(out)
+        x_dbl = self.x_proj(x_proj) # (B, L, dt_rank + 2*d_state)
+        delta, B_t, C_t = torch.split(x_dbl, [1, self.d_state, self.d_state], dim=-1)
+        
+        delta = torch.nn.functional.softplus(self.dt_proj(delta)) # (B, L, d_inner)
+        
+        # Simplified SSM step for PyTorch compatibility (no custom kernel)
+        A = -torch.exp(self.A_log) # (d_inner, d_state)
+        
+        y = torch.zeros(B, L, self.d_inner, device=x.device, dtype=x.dtype)
+        h = torch.zeros(B, self.d_inner, self.d_state, device=x.device, dtype=x.dtype)
+        
+        # Selective scan (loop-based, proxy for parallel scan)
+        # Note: In production, use compiled mamba kernel. This is a functional pure-torch representation.
+        for t in range(L):
+            delta_t = delta[:, t, :].unsqueeze(-1) # (B, d_inner, 1)
+            deltaA = torch.exp(delta_t * A) # (B, d_inner, d_state)
+            deltaB_u = delta_t * B_t[:, t, :].unsqueeze(1) * x_proj[:, t, :].unsqueeze(-1) # (B, d_inner, d_state)
+            
+            h = deltaA * h + deltaB_u
+            y[:, t, :] = (h * C_t[:, t, :].unsqueeze(1)).sum(dim=-1)
+            
+        y = y + x_proj * self.D
+        y = y * self.act(z)
+        out = self.out_proj(y)
         
         return out.transpose(1, 2).view(B, C, H, W) + x
 
@@ -57,12 +114,22 @@ class VSSMNet(nn.Module):
         
         self.stem = nn.Conv2d(in_channels, dim, kernel_size=3, padding=1)
         
-        # VSSM Blocks
-        self.vssm_blocks = nn.Sequential(*[SSMLinearAttention(dim) for _ in range(4)])
+        # VSSM Blocks (using PyTorch MambaBlock)
+        self.vssm_blocks = nn.Sequential(*[MambaBlock(d_model=dim) for _ in range(4)])
         
-        # FEM (Frequency Decoupling)
-        self.wavelet_down = HaarDownsample(dim)
-        self.fem_proj = nn.Conv2d(dim * 4, dim, kernel_size=1)
+        # FEM (Frequency Decoupling) 3-Level
+        self.multi_dwt = MultiLevelHaarDWT(dim)
+        
+        # Texture Branch (fuses HF1, HF2, HF3)
+        self.tconv1 = nn.Sequential(nn.Conv2d(dim*3, dim, 3, 1, 1), nn.ReLU(True))
+        self.tconv2 = nn.Sequential(nn.Conv2d(dim*3, dim, 3, 1, 1), nn.ReLU(True))
+        self.tconv3 = nn.Sequential(nn.Conv2d(dim*3, dim, 3, 1, 1), nn.ReLU(True))
+        self.tfuse = nn.Conv2d(dim, dim, 1)
+        
+        # Color Branch (processes LL3)
+        self.cconv = nn.Conv2d(dim, dim, 1)
+        
+        self.fem_proj = nn.Conv2d(dim * 2, dim, kernel_size=1)
         
         # Upsampling via Sub-Pixel
         upsample_blocks = []
@@ -84,9 +151,25 @@ class VSSMNet(nn.Module):
         
         vssm_feat = self.vssm_blocks(feat)
         
-        freq_feat = self.wavelet_down(feat)
-        freq_feat = self.fem_proj(freq_feat)
-        freq_feat = nn.functional.interpolate(freq_feat, scale_factor=2, mode="bilinear", align_corners=False)
+        # 3-Level DWT Decoupling
+        ll3, hfs = self.multi_dwt(feat) # hfs: [HF1, HF2, HF3]
+        
+        # Texture Stream Processing
+        hf1_feat = self.tconv1(hfs[0])
+        hf2_feat = self.tconv2(hfs[1])
+        hf3_feat = self.tconv3(hfs[2])
+        
+        # Upsample lower frequency HFs to match HF1 shape
+        hf2_up = nn.functional.interpolate(hf2_feat, size=hf1_feat.shape[-2:], mode="bilinear", align_corners=False)
+        hf3_up = nn.functional.interpolate(hf3_feat, size=hf1_feat.shape[-2:], mode="bilinear", align_corners=False)
+        texture_feat = self.tfuse(hf1_feat + hf2_up + hf3_up)
+        
+        # Color Stream Processing
+        ll3_feat = self.cconv(ll3)
+        ll3_up = nn.functional.interpolate(ll3_feat, size=hf1_feat.shape[-2:], mode="bilinear", align_corners=False)
+        
+        freq_feat = self.fem_proj(torch.cat([texture_feat, ll3_up], dim=1))
+        freq_feat = nn.functional.interpolate(freq_feat, size=vssm_feat.shape[-2:], mode="bilinear", align_corners=False)
         
         combined_feat = vssm_feat + freq_feat
         hr_feat = self.upsample(combined_feat)
@@ -174,3 +257,40 @@ class ControlNetColorizer(nn.Module):
         x_dec1 = self.dec1(d1)
         
         return torch.sigmoid(self.final(x_dec1))
+
+# --- 5. Adversarial Discriminator ---
+class PatchGANDiscriminator(nn.Module):
+    """PatchGAN Discriminator for Adversarial Loss."""
+    def __init__(self, in_channels: int = 3, ndf: int = 64, n_layers: int = 3):
+        super().__init__()
+        kw = 4
+        padw = 1
+        sequence = [
+            nn.Conv2d(in_channels, ndf, kernel_size=kw, stride=2, padding=padw),
+            nn.LeakyReLU(0.2, True)
+        ]
+        
+        nf_mult = 1
+        nf_mult_prev = 1
+        for n in range(1, n_layers):
+            nf_mult_prev = nf_mult
+            nf_mult = min(2 ** n, 8)
+            sequence += [
+                nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=2, padding=padw, bias=False),
+                nn.BatchNorm2d(ndf * nf_mult),
+                nn.LeakyReLU(0.2, True)
+            ]
+            
+        nf_mult_prev = nf_mult
+        nf_mult = min(2 ** n_layers, 8)
+        sequence += [
+            nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=1, padding=padw, bias=False),
+            nn.BatchNorm2d(ndf * nf_mult),
+            nn.LeakyReLU(0.2, True)
+        ]
+        
+        sequence += [nn.Conv2d(ndf * nf_mult, 1, kernel_size=kw, stride=1, padding=padw)]
+        self.model = nn.Sequential(*sequence)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.model(x)
