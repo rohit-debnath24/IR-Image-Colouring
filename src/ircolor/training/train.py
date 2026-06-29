@@ -78,7 +78,7 @@ class IRColorLightningModule(pl.LightningModule):
         if config.model.semantic.enabled:
             try:
                 from transformers import SegformerForSemanticSegmentation
-                semantic_net = SegformerForSemanticSegmentation.from_pretrained('nvidia/segformer-b0-finetuned-cityscapes-512-512')
+                semantic_net = SegformerForSemanticSegmentation.from_pretrained('nvidia/segformer-b0-finetuned-cityscapes-512-1024')
             except Exception as e:
                 print(f"Failed to load SegFormer: {e}. Using MockSegmenter.")
                 semantic_net = MockSegmenter()
