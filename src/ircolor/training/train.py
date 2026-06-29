@@ -12,6 +12,7 @@ import argparse
 
 import os
 import pytorch_lightning as pl
+from pytorch_lightning.loggers import WandbLogger
 from torch.utils.data import DataLoader, random_split
 import torch
 import torch.nn as nn
@@ -277,11 +278,18 @@ def main() -> None:
     
     # Initialize Model & Trainer
     model = IRColorLightningModule(config)
+    
+    wandb_logger = WandbLogger(
+        project=config.logging.wandb_project,
+        name=f"ircolor_{config.stage}_v{config.system.version}"
+    )
+    
     trainer = pl.Trainer(
         max_epochs=config.train.epochs,
         accelerator="auto",
         devices=1,
-        precision="16-mixed" if config.train.precision == "16-mixed" else 32
+        precision="16-mixed" if config.train.precision == "16-mixed" else 32,
+        logger=wandb_logger
     )
     
     print("Starting Trainer fit...")

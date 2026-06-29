@@ -10,10 +10,11 @@ This diagram details the deep learning neural network components and how the Str
 flowchart TD
     subgraph "VSSM Structural Backbone (Linear Complexity)"
         IR_In["Low-Res IR Tensors (128x128)"] --> Stem["Stem Convolution"]
-        Stem --> MainStream["Main Stream\n(State-Space Linear Attention)"]
-        Stem --> FEM["Frequency Enhancement Module\n(Wavelet Transform / Haar)"]
+        Stem --> MainStream["Main Stream\n(PyTorch MambaBlock SSM)"]
+        Stem --> FEM["Frequency Enhancement Module\n(3-Level Multi-Scale Haar DWT)"]
       
-        FEM -- "High-Frequency Textures" --> Fusion(("Feature Fusion"))
+        FEM -- "High-Frequency Textures (HF1, HF2, HF3)" --> Fusion(("Feature Fusion"))
+        FEM -- "Low-Frequency Color (LL3)" --> Fusion
         MainStream -- "Global Context" --> Fusion
       
         Fusion --> Up["PixelShuffle Upsampling"]
@@ -30,6 +31,7 @@ flowchart TD
         RGB_Out -.-> L1["L1 Pixel-wise Loss"]
         RGB_Out -.-> L_Grad["Direction-Aligned Gradient Loss\n(Enforces crisp 90° edges on x/y axes)"]
         RGB_Out -.-> L_Sem["Frozen SegFormer Guardrail\n(Prevents structural hallucinations)"]
+        RGB_Out -.-> L_Adv["PatchGAN Discriminator\n(Prevents desaturation/grayscale trap)"]
     end
 ```
 
@@ -41,7 +43,7 @@ This diagram illustrates the step-by-step data pipeline during inference/product
 sequenceDiagram
     participant Raw as Raw Landsat Data (B4, B5, B10)
     participant Pre as Geospatial Pre-Processor
-    participant AI as V2 Deep Cascade Network
+    participant AI as V2 Deep Cascade Network (Mamba+ControlNet)
     participant Post as Tiling & Blending Engine
     participant GIS as Final GeoTIFF (QGIS Ready)
 
@@ -54,7 +56,7 @@ sequenceDiagram
     Pre->>AI: Normalized Float32 Tensors
   
     activate AI
-    Note over AI: VSSMNet extracts & upscales structure (4x)
+    Note over AI: PyTorch Mamba Backbone extracts & upscales structure (4x)
     Note over AI: Cross-Attention injects edges to ControlNet
     Note over AI: ControlNet generates Vibrant RGB colors
     AI-->>Post: 512x512 RGB Prediction Tiles
@@ -78,9 +80,9 @@ flowchart TD
     %% VSSM Block Wireframe
     subgraph "VSSM Backbone Wireframe"
         Conv1["Initial Conv2d\nShape: (B, 64, 128, 128)"]
-        SSM["4x SSMLinearAttention\nShape: (B, 64, 128, 128)"]
-        Haar["HaarDownsample\nShape: (B, 256, 64, 64)"]
-        FEMProj["FEM Projection + Interpolate\nShape: (B, 64, 128, 128)"]
+        SSM["4x PyTorch MambaBlock\nShape: (B, 64, 128, 128)"]
+        Haar["3-Level MultiLevelHaarDWT\nOutput: LL3, [HF1, HF2, HF3]"]
+        FEMProj["Texture & Color Fusion + Interpolate\nShape: (B, 64, 128, 128)"]
         Fusion["Element-wise Add\nShape: (B, 64, 128, 128)"]
         PixShuff["PixelShuffle Upsampling\nBridge Features (K,V)\nShape: (B, 64, 512, 512)"]
         ConvOut["HR IR Image\nShape: (B, 2, 512, 512)"]
@@ -97,6 +99,11 @@ flowchart TD
       
         Dec1["Decoder Block\nShape: (B, 32, 512, 512)"]
         Final["Final Conv2d (RGB)\nShape: (B, 3, 512, 512)"]
+    end
+
+    %% Training Discriminator
+    subgraph "Adversarial Training"
+        PatchGAN["PatchGAN Discriminator\nReal vs Fake"]
     end
   
     %% Connections
@@ -119,4 +126,6 @@ flowchart TD
     CA2 --> Dec1
     CA1 -.-> Dec1
     Dec1 --> Final
+    
+    Final -.-> PatchGAN
 ```
