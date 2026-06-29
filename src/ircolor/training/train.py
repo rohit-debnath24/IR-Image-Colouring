@@ -284,12 +284,16 @@ def main() -> None:
         name=f"ircolor_{config.stage}_v{config.system.version}"
     )
     
+    # Make it Network-Proof on Colab by saving checkpoints directly to Google Drive
+    default_root_dir = "/content/drive/MyDrive/IR-Image-Colouring/" if os.path.exists("/content/drive/MyDrive") else None
+    
     trainer = pl.Trainer(
         max_epochs=config.train.epochs,
         accelerator="auto",
         devices=1,
         precision="16-mixed" if config.train.precision == "16-mixed" else 32,
-        logger=wandb_logger
+        logger=wandb_logger,
+        default_root_dir=default_root_dir
     )
     
     print("Starting Trainer fit...")
